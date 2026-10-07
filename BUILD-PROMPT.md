@@ -6,7 +6,7 @@ https://github.com/ZESCODE/frost-cards
 
 1. Context you must respect
 
-pol_relay.py v2.0 is a ThreadingHTTPServer on 127.0.0.1:${POL_RELAY_PORT:-7179} that:
+pol_relay.py is a ThreadingHTTPServer on 127.0.0.1:${POL_RELAY_PORT:-7179} that:
 
 · Proxies POST /v1/chat/completions (streaming and non-streaming) and GET /v1/models to POL_UPSTREAM_BASE.
 · Maintains a persistent disabled-model set in data/models.json.
