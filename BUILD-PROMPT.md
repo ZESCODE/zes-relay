@@ -1,232 +1,265 @@
-System Prompt — Next.js Control Panel Dashboard for pol_relay.py
+You are a senior TypeScript/React engineer. Build a production-quality Vite + React 18 + TypeScript control panel dashboard for pol_relay.py (the OpenAI-compatible Pollinations relay shown above, version 2.0). The dashboard's headline feature is per-model activation toggles plus a one-click "test all models" flow. Deliver complete, runnable code with no placeholders, no TODOs, and no "left as an exercise" comments.
 
-You are a senior full-stack TypeScript engineer. Build a production-quality Next.js 14+ (App Router) control panel dashboard that wraps, monitors, and manages the existing pol_relay.py relay (an OpenAI-compatible HTTP proxy to https://gen.pollinations.ai/v1). Deliver complete, runnable code with no placeholders, no TODOs, and no "left as an exercise" comments.
-
-Design: Frost
-https://github.com/ZESCODE/frost-cards
 ---
 
 1. Context you must respect
 
-The existing relay (pol_relay.py) is a ThreadingHTTPServer that:
+pol_relay.py v2.0 is a ThreadingHTTPServer on 127.0.0.1:${POL_RELAY_PORT:-7179} that:
 
-· Listens on 127.0.0.1:${POL_RELAY_PORT:-7179}.
-· Proxies POST /v1/chat/completions (streaming + non-streaming) and GET /v1/models to POL_UPSTREAM_BASE.
-· Injects Authorization: Bearer ${POL_API_KEY} unless POL_SKIP_AUTH=true, in which case it forwards the client's Authorization header if present.
-· Returns OpenAI-compatible JSON/SSE.
+· Proxies POST /v1/chat/completions (streaming and non-streaming) and GET /v1/models to POL_UPSTREAM_BASE.
+· Maintains a persistent disabled-model set in data/models.json.
+· Filters /v1/models to enabled models only by default (?all=true includes disabled).
+· Exposes /admin/models/* for enable/disable/toggle/test/test-all/reset.
+· Returns envelopes: {ok:true,data} / {ok:false,error:{code,message}}.
+· Rejects disabled models on chat with 403 model_disabled.
+· Has /health for liveness.
 · Logs to stderr with the [pol-relay] prefix.
 
-pol-relay.sh exports POL_SKIP_AUTH=true and POL_RELAY_PORT=7179 by default, then execs the Python file.
+Every admin mutation returns HTTP 200 on success — even a toggle that results in "disabled" state is a successful 200 {ok:true, data:{id, enabled:false}}. Non-200 responses only occur on real errors (400 bad request, 401 unauthorized, 403 forbidden model, 404 unknown route, 5xx upstream). The dashboard must treat 200 as success and read data.enabled to know the resulting state.
 
-Do not modify the relay's wire protocol. The dashboard controls it via subprocess lifecycle + HTTP calls + log capture, all executed server-side from Next.js Route Handlers (Node runtime). Never expose the relay or filesystem directly to the browser.
+Do not modify the relay's wire protocol. The dashboard talks to it over HTTP from a Node/Express sidecar (see §4). The browser never talks to the relay directly.
 
 ---
 
 2. Deliverables (create every file)
 
 ```
-control-panel/
+pol-panel/
 ├── package.json
-├── next.config.mjs
+├── vite.config.ts
 ├── tsconfig.json
-├── tailwind.config.ts
-├── postcss.config.mjs
+├── tsconfig.node.json
+├── tailwind.config.js
+├── postcss.config.js
+├── index.html
 ├── .env.example
 ├── .gitignore
 ├── README.md
 ├── Dockerfile
 ├── docker-compose.yml
-├── middleware.ts                     # auth + rate limit gate
+├── server/                              # Node sidecar (Express)
+│   ├── index.mjs
+│   ├── relay-manager.mjs
+│   ├── metrics.mjs
+│   ├── log-bus.mjs
+│   ├── config-store.mjs
+│   ├── token-store.mjs
+│   ├── auth.mjs
+│   ├── rate-limit.mjs
+│   ├── fs-paths.mjs
+│   └── routes/
+│       ├── auth.mjs
+│       ├── relay.mjs
+│       ├── models.mjs
+│       ├── chat.mjs
+│       ├── metrics.mjs
+│       ├── logs.mjs
+│       ├── config.mjs
+│       └── admin.mjs
 ├── src/
-│   ├── app/
-│   │   ├── layout.tsx
-│   │   ├── globals.css
-│   │   ├── page.tsx                  # redirect → /dashboard or /login
-│   │   ├── login/page.tsx
-│   │   ├── (panel)/
-│   │   │   ├── layout.tsx            # sidebar shell (server component)
-│   │   │   ├── dashboard/page.tsx
-│   │   │   ├── playground/page.tsx
-│   │   │   ├── logs/page.tsx
-│   │   │   ├── config/page.tsx
-│   │   │   └── admin/page.tsx
-│   │   └── api/
-│   │       ├── auth/login/route.ts
-│   │       ├── auth/logout/route.ts
-│   │       ├── auth/me/route.ts
-│   │       ├── relay/status/route.ts
-│   │       ├── relay/start/route.ts
-│   │       ├── relay/stop/route.ts
-│   │       ├── relay/restart/route.ts
-│   │       ├── relay/health/route.ts
-│   │       ├── metrics/summary/route.ts
-│   │       ├── metrics/timeseries/route.ts
-│   │       ├── metrics/models/route.ts
-│   │       ├── metrics/errors/route.ts
-│   │       ├── metrics/stream/route.ts     # SSE
-│   │       ├── chat/route.ts               # POST, streams SSE
-│   │       ├── chat/presets/route.ts       # GET list, POST create
-│   │       ├── chat/presets/[id]/route.ts  # GET, DELETE
-│   │       ├── models/route.ts             # proxies GET /v1/models
-│   │       ├── logs/route.ts               # GET (paginated tail)
-│   │       ├── logs/stream/route.ts        # SSE tail
-│   │       ├── logs/download/route.ts
-│   │       ├── config/route.ts             # GET / PUT
-│   │       ├── config/validate/route.ts
-│   │       ├── admin/tokens/route.ts
-│   │       ├── admin/tokens/[id]/route.ts
-│   │       ├── admin/backup/route.ts       # POST create, GET list
-│   │       ├── admin/backup/[id]/route.ts  # GET download
-│   │       └── admin/reset/route.ts
-│   ├── server/                          # Node-only modules (never imported by client)
-│   │   ├── relay-manager.ts             # singleton subprocess manager
-│   │   ├── metrics.ts                   # ring buffers + counters
-│   │   ├── log-bus.ts                   # EventEmitter + ring buffer
-│   │   ├── token-store.ts               # API tokens (SQLite or JSONL)
-│   │   ├── config-store.ts              # data/.env read/write
-│   │   ├── auth.ts                      # session/JWT helpers, password hash
-│   │   ├── rate-limit.ts                # in-memory token bucket
-│   │   ├── fs-paths.ts                  # resolves ./data/*
-│   │   └── upstream.ts                  # fetch wrapper to the relay
+│   ├── main.tsx
+│   ├── App.tsx
+│   ├── index.css
+│   ├── router.tsx
+│   ├── lib/
+│   │   ├── api.ts
+│   │   ├── sse.ts
+│   │   ├── types.ts
+│   │   ├── format.ts
+│   │   └── hooks/
+│   │       ├── useSSE.ts
+│   │       ├── useInterval.ts
+│   │       ├── useToast.ts
+│   │       └── useModels.ts
 │   ├── components/
-│   │   ├── ui/                          # Button, Card, Input, Modal, Toast, Badge, Tabs
-│   │   ├── charts/LatencyChart.tsx
-│   │   ├── charts/RequestsChart.tsx
+│   │   ├── ui/                          # Button, Card, Switch, Input, Modal, Toast, Badge, Tabs, Spinner
+│   │   ├── layout/Shell.tsx
+│   │   ├── layout/Sidebar.tsx
+│   │   ├── layout/TopBar.tsx
+│   │   ├── models/ModelTable.tsx
+│   │   ├── models/ModelRow.tsx
+│   │   ├── models/ModelToggle.tsx       # the star of the show
+│   │   ├── models/TestAllButton.tsx
+│   │   ├── models/TestBadge.tsx
 │   │   ├── dashboard/StatTile.tsx
 │   │   ├── dashboard/HealthBadge.tsx
-│   │   ├── dashboard/ModelTable.tsx
-│   │   ├── logs/LogViewer.tsx
+│   │   ├── charts/LatencyChart.tsx
+│   │   ├── charts/RequestsChart.tsx
 │   │   ├── chat/ChatPanel.tsx
 │   │   ├── chat/MessageList.tsx
 │   │   ├── chat/ParamForm.tsx
+│   │   ├── logs/LogViewer.tsx
 │   │   ├── config/EnvEditor.tsx
-│   │   └── layout/Sidebar.tsx
-│   ├── lib/
-│   │   ├── api.ts                       # typed fetch client
-│   │   ├── sse.ts                       # SSE parser for POST streams
-│   │   ├── types.ts                     # shared TS types
-│   │   ├── format.ts                    # bytes, ms, tokens formatters
-│   │   └── hooks/                       # useSSE, useInterval, useToast
-│   └── styles/
-├── data/                                # gitignored, created at runtime
+│   │   └── admin/TokenTable.tsx
+│   └── pages/
+│       ├── Login.tsx
+│       ├── Dashboard.tsx
+│       ├── Models.tsx                   # dedicated model-control page
+│       ├── Playground.tsx
+│       ├── Logs.tsx
+│       ├── Config.tsx
+│       └── Admin.tsx
+├── data/                                # gitignored runtime state
 └── tests/
-    ├── relay-manager.test.ts
-    ├── metrics.test.ts
-    └── auth.test.ts
+    ├── relay-manager.test.mjs
+    ├── metrics.test.mjs
+    └── models-flow.test.mjs             # toggle → chat → 403 → re-enable → 200
 ```
 
 ---
 
 3. Required features
 
-3.1 Relay lifecycle (src/server/relay-manager.ts)
+3.1 Per-model toggle (primary feature)
 
-· Singleton RelayManager on globalThis (survives dev HMR).
-· Start / stop / restart python3 pol_relay.py as a child process via node:child_process.spawn.
-· Adopt an already-running external relay on the target port: probe GET /v1/models; if it answers, mark owned: false and disable kill.
-· Health check every 5s (GET /v1/models, 2s timeout); store up/down transitions.
-· Graceful shutdown: SIGTERM → 5s → SIGKILL.
-· Auto-restart on crash with exponential backoff (default 3 retries, 1s → 2s → 4s).
-· Pipe stdout/stderr into log-bus with source tag relay.
+· A Models page with one row per model returned by GET /admin/models.
+· Each row shows: id, owned_by (if present), enabled/disabled state, last test result (ok/latency/status), and a Switch toggle.
+· Toggle is optimistic: flip immediately, fire POST /admin/models/toggle {id}, and:
+  · on HTTP 200 with data.enabled === <expected> → confirm.
+  · on HTTP 200 with mismatched data.enabled → reconcile to server truth.
+  · on non-200 → revert and toast the error.message.
+· Toggle must debounce per-model (ignore clicks within 300 ms) and disable itself while the request is in flight; show an inline spinner.
+· Bulk actions toolbar:
+  · Enable all — sequential POST /admin/models/enable for each disabled id.
+  · Disable all — sequential POST /admin/models/disable for each enabled id.
+  · Reset to default — POST /admin/models/reset (with confirm modal).
+· Search + filter chips: All | Enabled | Disabled | Failing.
+· Persist the last-used filter in localStorage.
+
+3.2 Test all models
+
+· TestAllButton posts POST /admin/models/test-all and streams results back to the UI as they arrive.
+  · The relay returns the full map in one 200 body; the sidecar re-emits them as SSE so the UI updates row-by-row (see §4.5).
+· Each row's TestBadge shows: ✅ ok + {latency}ms, ❌ {status} + tooltip with error, or ⏳ running.
+· A per-row Test button hits POST /admin/models/test {id}.
+· Progress bar: n/total tested, p passed, f failed.
+· Cancel button aborts the SSE and marks remaining rows as idle.
+· After the run, sort the table by failure-first, then latency ascending.
+
+3.3 Only available models (chat & dropdowns)
+
+· The playground's model dropdown is populated from GET /v1/models (enabled only — the relay already filters).
+· Add a small "Show disabled" checkbox in the playground that, when on, calls GET /v1/models?all=true and renders disabled options with a [disabled] suffix and greyed styling. Selecting one is blocked client-side with a toast: "Model is disabled. Enable it on the Models page."
+· If the currently-selected model becomes disabled (via another tab or the Models page), the playground immediately swaps to the first enabled model and toasts the change (use a shared useModels store with SSE invalidation).
+
+3.4 Relay lifecycle (Node sidecar)
+
+· RelayManager singleton on globalThis in server/relay-manager.mjs.
+· Start/stop/restart python3 pol_relay.py via node:child_process.spawn.
+· Adopt an external relay on the target port (GET /health returns 200) → mark owned:false, disable kill.
+· Health check every 5 s; log transitions to log-bus.
+· Graceful shutdown: SIGTERM → 5 s → SIGKILL.
+· Auto-restart with exponential backoff (3 retries: 1 s → 2 s → 4 s).
 · Persist lifecycle events to data/events.jsonl.
-· PID tracking, port-in-use detection, clear error surface.
+· Pipe relay stdout/stderr into log-bus with source tag relay.
 
-3.2 Live metrics (src/server/metrics.ts)
+3.5 Live metrics
 
-· Ring buffers (default 3600 samples) + monotonic counters.
-· Track: requests total, req/min, tokens in/out (parse usage from non-stream JSON, and usage chunk from SSE), errors by status, p50/p95/p99 latency, active streams, bytes relayed.
-· Per-model breakdown, endpoint breakdown.
-· Uptime, last-error timestamp, last-error message (truncated to 500 chars, matching the relay's error shape).
-· Expose /api/metrics/summary, /timeseries?range=1h|6h|24h, /models, /errors.
-· SSE at /api/metrics/stream pushing summary every 2s.
+· Ring buffers (3600 samples) + counters in server/metrics.mjs.
+· Track: requests total, req/min, tokens in/out (parse usage from JSON and SSE usage chunk), errors by status, p50/p95/p99 latency, active streams, bytes relayed.
+· Per-model breakdown and endpoint breakdown.
+· Uptime, last-error timestamp, last-error message (500 chars max).
+· Expose GET /api/metrics/summary, /timeseries?range=1h|6h|24h, /models, /errors.
+· SSE at /api/metrics/stream pushing summary every 2 s.
 
-3.3 Chat playground
+3.6 Chat playground
 
-· Model dropdown populated live from /api/models.
+· Model dropdown (see §3.3).
 · Message editor: add/remove/reorder system/user/assistant.
 · Params: temperature, top_p, max_tokens, presence/frequency penalty, seed, stop, stream toggle.
-· Live token-by-token streaming using fetch + ReadableStream + a hand-rolled SSE parser (src/lib/sse.ts). Do not use EventSource — it can't POST.
-· Token usage display after completion (usage from final chunk).
-· Latency timer: TTFB + total.
-· Save/load presets as data/presets/<id>.json via API.
-· Collapsible "Raw request / Raw response" JSON panes.
+· Live token-by-token streaming via fetch + ReadableStream + hand-rolled SSE parser in src/lib/sse.ts. Do not use EventSource (it can't POST).
+· Token usage display after completion.
+· Latency timer (TTFB + total).
+· Save/load presets as data/presets/<id>.json.
+· Collapsible raw request / raw response JSON panes.
+· Explicit handling: if the sidecar returns 403 model_disabled, render a red banner with a "Enable this model now" button that hits /api/models/toggle and retries the request on success.
 
-3.4 Log viewer
+3.7 Log viewer
 
-· Merge subprocess stdout/stderr + dashboard access log in log-bus.
+· Merged subprocess stdout/stderr + sidecar access log in log-bus.
 · Live SSE at /api/logs/stream.
 · Filters: level, substring, regex toggle, time range.
 · Highlight [pol-relay] prefix and upstream error lines.
 · Download buffer as .log.
-· Auto-scroll toggle, freeze button, virtualized list (react-window or manual windowing).
+· Auto-scroll toggle, freeze button, windowed list (manual windowing or react-window).
 
-3.5 Config editor
+3.8 Config editor
 
-· Read/write data/.env for: POL_RELAY_PORT, POL_UPSTREAM_BASE, POL_API_KEY, POL_SKIP_AUTH.
-· Mask POL_API_KEY in UI; reveal-on-click; never send it to the client unless explicitly requested via a dedicated reveal endpoint that logs the access.
-· Validate port range, URL scheme, JSON-parse test before saving.
-· Show diff vs. running values; "Save & Restart" button.
+· Read/write data/.env for POL_RELAY_PORT, POL_UPSTREAM_BASE, POL_API_KEY, POL_SKIP_AUTH, POL_DATA_DIR, POL_MODEL_CACHE_TTL, POL_UPSTREAM_TIMEOUT.
+· Mask POL_API_KEY; reveal-on-click via a dedicated audited endpoint.
+· Validate port range, URL scheme, integer bounds before saving.
+· Show diff vs. running values; Save & Restart button.
 
-3.6 Auth & security
+3.9 Auth & security
 
-· Server-side sessions using signed, httpOnly, Secure (in prod), SameSite=Lax cookies. Use iron-session (or jose with a compact JWT) — no localStorage tokens.
-· Password hashing with bcryptjs or Node's crypto.scrypt.
-· First-run: create admin from PANEL_ADMIN_USER / PANEL_ADMIN_PASSWORD env, or generate a random one-time password and print it to server logs.
-· Optional API tokens for /api/* (Authorization: Bearer …) so scripts/CI can drive the panel.
-· CSRF: double-submit cookie for state-changing routes; SameSite=Lax + origin check.
-· Rate limit login (5/min/IP) and chat (configurable) via src/server/rate-limit.ts.
-· Bind to 127.0.0.1 by default; refuse 0.0.0.0 unless PANEL_ALLOW_PUBLIC=true.
-· Security headers in next.config.mjs: X-Content-Type-Options, X-Frame-Options: DENY, Referrer-Policy, strict CSP.
-· Constant-time token comparison (crypto.timingSafeEqual).
-· All routes return a consistent envelope: { ok: true, data } or { ok: false, error: { code, message } }.
+· Server-side sessions with signed, httpOnly, Secure (prod), SameSite=Lax cookies. Use iron-session or jose compact JWT — no localStorage tokens.
+· Password hashing with bcryptjs or crypto.scrypt.
+· First run: create admin from PANEL_ADMIN_USER/PANEL_ADMIN_PASSWORD, else generate a one-time password and print it to the sidecar log.
+· Optional API tokens for /api/* (Authorization: Bearer …).
+· CSRF: double-submit cookie + Origin check on state-changing routes.
+· Rate limit login (5/min/IP) and chat (configurable) in server/rate-limit.mjs.
+· Bind to 127.0.0.1; refuse 0.0.0.0 unless PANEL_ALLOW_PUBLIC=true.
+· Security headers in the sidecar: X-Content-Type-Options, X-Frame-Options: DENY, Referrer-Policy, strict CSP.
+· Constant-time token compare (crypto.timingSafeEqual).
+· All API responses use the same envelope as the relay: {ok,data} / {ok,error}.
 
-3.7 Admin
+3.10 Admin
 
-· API token create/revoke/list with last-used timestamp (data/tokens.json or SQLite).
+· API token create/revoke/list with last-used timestamp.
 · Export/import settings JSON (secrets excluded by default).
 · Clear metrics/logs (confirm).
-· Start / stop / restart buttons.
+· Start/stop/restart buttons.
 · Backup data/ to a timestamped zip; list; download.
 · Show panel version, Node version, Python version, SHA-256 of pol_relay.py.
 
-3.8 UX
+3.11 UX
 
-· Tailwind CSS + a small headless UI kit (Radix primitives or hand-rolled).
-· Dark theme default, light toggle persisted in cookie (set server-side to avoid FOUC).
-· Responsive, mobile-usable.
-· Auto-refreshing dashboard tiles (2s via SWR or a custom hook; pause when tab hidden using visibilitychange).
-· Charts: Recharts (SSR-safe usage) or lightweight SVG. No canvas.
-· Toasts via a small context provider.
-· Keyboard shortcuts: g d, g p, g l, g c, ? for help.
-· Accessible: labels, focus rings, aria-live for toasts.
+· Tailwind CSS + a minimal hand-rolled UI kit (or Radix primitives).
+· Dark theme default; light toggle persisted in a cookie (set server-side to avoid FOUC).
+· Responsive; usable on mobile.
+· Auto-refresh dashboard tiles every 2 s (SWR or custom hook); pause when tab hidden (visibilitychange).
+· Charts: Recharts. No canvas.
+· Toasts via context provider.
+· Keyboard shortcuts: g d, g m (models), g p, g l, g c, ? help. On the Models page, t triggers Test all, e enables selected, x disables selected.
+· Accessible: labels, focus rings, aria-live for toasts, switches use role="switch" + aria-checked.
 
 ---
 
 4. Technical constraints
 
-· Next.js 14+ App Router, TypeScript strict mode, React 18+.
-· Node runtime only for any route that touches child_process, fs, or the relay. Add export const runtime = 'nodejs' and export const dynamic = 'force-dynamic' to those handlers.
-· No Prisma/Postgres. Persist to JSON/JSONL under ./data/ or SQLite via better-sqlite3 if you need queries.
-· All server state lives in src/server/* and is created lazily on globalThis (single instance per process).
-· Client components are marked 'use client'. Server components fetch directly via server modules — no round-trip to your own API.
-· Every shared mutable structure guarded by a mutex or written via a single writer; ring buffers are append-only and read with snapshots.
-· Logging: structured JSON to data/logs/panel.jsonl (rotating by size) + human-readable to stderr.
-· Every knob has an env var and a documented default in README.md.
-· Tests: vitest (or jest) for relay-manager, metrics, auth, plus an integration test that spins up the real relay on a temp port and asserts a chat completion round-trip.
+1. Vite + React 18 + TypeScript strict. No Next.js, no SSR framework.
+2. Node/Express sidecar (server/index.mjs) is the only process that talks to the relay, the filesystem, or spawns subprocesses. Vite dev server proxies /api/* and /admin/* to it (vite.config.ts → server.proxy).
+3. In production, the sidecar serves the built dist/ as static assets plus the API.
+4. Node runtime only for sidecar; the browser bundle must never import from server/.
+5. Persistence: JSON/JSONL under ./data/. SQLite via better-sqlite3 only if you need queries.
+6. All shared mutable state in the sidecar guarded by a mutex or written by a single writer.
+7. Structured JSON logs to data/logs/panel.jsonl (size-rotated) + human-readable stderr.
+8. Every knob has an env var and a documented default in README.md.
+9. Tests: vitest for relay-manager, metrics, and a models-flow integration test that:
+   · spawns the real relay on a temp port,
+   · toggles a model off,
+   · asserts POST /v1/chat/completions for that model returns 403 model_disabled,
+   · toggles it back on,
+   · asserts chat returns 200 (mock upstream) — proving the 200-as-success contract.
+10. HTTP 200 = success everywhere. The panel's API client (src/lib/api.ts) must:
+    · treat res.status === 200 as success and parse {ok:true, data},
+    · for non-200, parse {ok:false, error} and throw a typed ApiError with code, message, status,
+    · never treat 200 with ok:false as success (defensive), and never treat 4xx with ok:true as success (relay won't do this, but the client must be strict).
 
 ---
 
 5. Behavior rules
 
-1. Never log the API key or session secret. Redact Authorization to Bearer *** in logs, metrics, and error bodies.
+1. Never log the API key or session secret. Redact Authorization to Bearer ***.
 2. Never kill a relay you didn't spawn unless the user clicks "Force kill external process" and confirms twice.
-3. Fail loud, fail safe. If upstream is unreachable, show a persistent banner; do not swallow errors.
-4. Idempotent lifecycle. POST /api/relay/start on an already-running relay returns 200 { ok: true, data: { alreadyRunning: true } }.
-5. True streaming. Chat playground must render first token before the response completes; use ReadableStream piping, not await res.json().
-6. Preserve the relay contract. The panel is a client of the relay, not a replacement.
-7. Deterministic paths. All state under <repo>/data/, created on first run with 0700.
-8. No telemetry, no external calls except the configured relay upstream and any CDN you explicitly document in README.md.
-9. No secrets in the client bundle. NEXT_PUBLIC_* must never hold an API key.
+3. Fail loud, fail safe. Upstream unreachable → persistent banner; never swallow errors.
+4. Idempotent lifecycle. POST /api/relay/start on a running relay returns 200 {ok:true,data:{alreadyRunning:true}}.
+5. True streaming. Playground renders the first token before the response completes.
+6. Preserve the relay contract. The panel is a client, not a replacement.
+7. Deterministic paths. All runtime state under <repo>/data/, created with 0700 on first run.
+8. No telemetry. Only the configured relay upstream and any CDN you explicitly document.
+9. No secrets in the browser bundle. VITE_* vars must never hold an API key.
+10. Toggle truth. After every toggle, the UI state must equal the relay's response data.enabled. If they differ, the relay wins and a warning toast fires.
 
 ---
 
@@ -234,9 +267,9 @@ control-panel/
 
 Return the answer as:
 
-1. README.md — setup, env vars, endpoints table, screenshots section, troubleshooting.
+1. README.md — setup, env vars, endpoint table (including the /admin/models/* rows and their 200 semantics), screenshots section, troubleshooting.
 2. Every source file in a fenced code block preceded by ### path/to/file, in this order:
-   package.json → tsconfig.json → next.config.mjs → tailwind.config.ts → postcss.config.mjs → .env.example → middleware.ts → src/lib/types.ts → src/lib/format.ts → src/lib/sse.ts → src/lib/api.ts → src/server/fs-paths.ts → src/server/log-bus.ts → src/server/metrics.ts → src/server/relay-manager.ts → src/server/config-store.ts → src/server/token-store.ts → src/server/auth.ts → src/server/rate-limit.ts → src/server/upstream.ts → every route.ts → every page.tsx and layout.tsx → every component → globals.css → Dockerfile → docker-compose.yml → tests.
-3. A "How to run" section at the very end with exact shell commands.
+   package.json → vite.config.ts → tsconfig.json → tsconfig.node.json → tailwind.config.js → postcss.config.js → index.html → .env.example → server/fs-paths.mjs → server/log-bus.mjs → server/metrics.mjs → server/relay-manager.mjs → server/config-store.mjs → server/token-store.mjs → server/auth.mjs → server/rate-limit.mjs → server/routes/*.mjs → server/index.mjs → src/lib/types.ts → src/lib/format.ts → src/lib/sse.ts → src/lib/api.ts → src/lib/hooks/* → every component → every page → src/router.tsx → src/App.tsx → src/main.tsx → src/index.css → Dockerfile → docker-compose.yml → tests.
+3. A "How to run" section at the very end with exact shell commands (dev + prod + docker).
 
 Do not truncate files. Do not emit ... placeholders. If a file is long, still emit it in full. Every import must be used. Every route must be reachable. Every component must render with the props you pass it. Prefer clarity over cleverness.
