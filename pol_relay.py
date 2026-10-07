@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
 """
-pol_relay.py — Pollinations relay with:
-  * Tier-aware routing (anonymous / seed / flower key pool)
-  * Multi-key support via POL_API_KEYS JSON
-  * Model enable/disable toggle (persisted to disk)
-  * /v1/config endpoint for the Vite dashboard
-  * /v1/models/toggle to flip model availability
-  * /v1/models/health with TTL cache
-  * Per-tier token-bucket rate limiting
-  * Proper chunked streaming (fixes original Content-Length bug)
+pol_relay.py — OpenAI-compatible relay for Pollinations with model controls.
 
-Environment variables:
-  POL_RELAY_PORT    default 7179
-  POL_UPSTREAM_BASE default https://gen.pollinations.ai/v1
-  POL_SKIP_AUTH     default true — if true, client Authorization header is not required
-  POL_API_KEY       legacy single key (used as 'anonymous' key if POL_API_KEYS unset)
-  POL_API_KEYS      JSON map: {"anonymous":"none","seed":"sk_xxx","flower":"sk_yyy"}
-  POL_STATE_FILE    path to persist disabled-model list (default ./pol_state.json)
-  POL_VERBOSE       "true" for verbose upstream logging
+Env:
+  POL_RELAY_PORT         (default 7179)
+  POL_UPSTREAM_BASE      (default https://gen.pollinations.ai/v1)
+  POL_API_KEY            (default "none")
+  POL_SKIP_AUTH          (default false) — skip client auth and forward caller's header
+  POL_DATA_DIR           (default ./data) — where models.json lives
+  POL_MODEL_CACHE_TTL    (default 60s)   — /v1/models cache
+  POL_UPSTREAM_TIMEOUT   (default 600s)  — chat completions timeout
 """
-
 import json
 import os
 import sys
@@ -28,642 +19,445 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+from urllib.parse import urlparse, parse_qs
 
 PORT = int(os.environ.get("POL_RELAY_PORT", "7179"))
 UPSTREAM = os.environ.get("POL_UPSTREAM_BASE", "https://gen.pollinations.ai/v1").rstrip("/")
+API_KEY = os.environ.get("POL_API_KEY", "none")
 SKIP_AUTH = os.environ.get("POL_SKIP_AUTH", "false").lower() == "true"
-VERBOSE = os.environ.get("POL_VERBOSE", "false").lower() == "true"
-STATE_FILE = os.environ.get(
-    "POL_STATE_FILE",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "pol_state.json"),
+DATA_DIR = os.environ.get(
+    "POL_DATA_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
 )
+MODELS_FILE = os.path.join(DATA_DIR, "models.json")
+MODEL_CACHE_TTL = int(os.environ.get("POL_MODEL_CACHE_TTL", "60"))
+UPSTREAM_TIMEOUT = int(os.environ.get("POL_UPSTREAM_TIMEOUT", "600"))
 
-# ---- API key pool ---------------------------------------------------------
-def _load_api_keys():
-    raw = os.environ.get("POL_API_KEYS", "").strip()
-    keys = {}
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                keys = {str(k): str(v) for k, v in parsed.items()}
-        except Exception as e:
-            sys.stderr.write(f"[pol-relay] failed to parse POL_API_KEYS: {e}\n")
-    if not keys:
-        # Backward compatibility with the old single-key env var.
-        legacy = os.environ.get("POL_API_KEY", "none")
-        keys = {"anonymous": legacy}
-    # Ensure all known tiers have an entry (fall back to "none" = no auth).
-    for tier in ("anonymous", "seed", "flower"):
-        keys.setdefault(tier, "none")
-    return keys
+os.makedirs(DATA_DIR, exist_ok=True)
 
-API_KEYS = _load_api_keys()
-
-# ---------------------------------------------------------------------------
-# Model -> tier map. Extend this as Pollinations adds new models.
-# Anything not in the map is assumed to require "seed" tier.
-# ---------------------------------------------------------------------------
-MODEL_TIER_MAP = {
-    # Anonymous tier
-    "openai-fast": "anonymous",
-    # Seed tier
-    "openai": "seed",
-    "openai-large": "seed",
-    "openai-audio": "seed",
-    "gemini": "seed",
-    "gemini-fast": "seed",
-    "gemini-large": "seed",
-    "gemini-legacy": "seed",
-    "gemini-search": "seed",
-    "claude": "seed",
-    "claude-fast": "seed",
-    "claude-large": "seed",
-    "claude-legacy": "seed",
-    "perplexity-reasoning": "seed",
-    "perplexity-fast": "seed",
-    "deepseek": "seed",
-    "mistral": "seed",
-    "grok": "seed",
-    "kimi": "seed",
-    "qwen-coder": "seed",
-    "qwen-safety": "seed",
-    "glm": "seed",
-    "minimax": "seed",
-    "nova-fast": "seed",
-    "midijourney": "seed",
-    "chickytutor": "seed",
-    # Flower tier
-    "gptimage": "flower",
+_START_TS = time.time()
+_state_lock = threading.RLock()
+_state = {
+    "disabled": set(),      # model ids the operator turned off
+    "cache": [],            # last good upstream model list
+    "cache_ts": 0.0,
+    "test_results": {},     # id -> {ok, status, latency_ms, ts, error}
 }
 
-DEFAULT_TIER = "seed"
 
-def _model_tier(model_name: str) -> str:
-    return MODEL_TIER_MAP.get(model_name, DEFAULT_TIER)
-
-def _key_for_tier(tier: str) -> str:
-    key = API_KEYS.get(tier)
-    if key and key != "none":
-        return key
-    # Fallback chain: seed -> anonymous -> none
-    for fallback in ("seed", "anonymous"):
-        k = API_KEYS.get(fallback)
-        if k and k != "none":
-            return k
-    return "none"
-
-# ---------------------------------------------------------------------------
-# Persistent state (disabled models)
-# ---------------------------------------------------------------------------
-_state_lock = threading.Lock()
-_state = {"disabled_models": set()}
-
+# ── state persistence ────────────────────────────────────────────────────────
 def _load_state():
+    if not os.path.isfile(MODELS_FILE):
+        return
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+        with open(MODELS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        disabled = data.get("disabled_models", [])
+        disabled = data.get("disabled", [])
         if isinstance(disabled, list):
-            _state["disabled_models"] = set(str(m) for m in disabled)
-        sys.stderr.write(
-            f"[pol-relay] loaded state: {len(_state['disabled_models'])} disabled models\n"
-        )
-    except FileNotFoundError:
-        pass
+            _state["disabled"] = {str(x) for x in disabled}
     except Exception as e:
-        sys.stderr.write(f"[pol-relay] state load error: {e}\n")
+        sys.stderr.write(f"[pol-relay] models.json load failed: {e}\n")
+
 
 def _save_state():
-    try:
-        with _state_lock:
-            snapshot = {"disabled_models": sorted(_state["disabled_models"])}
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, indent=2)
-        os.replace(tmp, STATE_FILE)
-    except Exception as e:
-        sys.stderr.write(f"[pol-relay] state save error: {e}\n")
-
-def _is_disabled(model_name: str) -> bool:
     with _state_lock:
-        return model_name in _state["disabled_models"]
+        payload = {
+            "disabled": sorted(_state["disabled"]),
+            "updated_at": time.time(),
+        }
+    tmp = MODELS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, MODELS_FILE)
 
-def _set_disabled(model_name: str, disabled: bool):
-    with _state_lock:
-        if disabled:
-            _state["disabled_models"].add(model_name)
-        else:
-            _state["disabled_models"].discard(model_name)
-    _save_state()
 
-# ---------------------------------------------------------------------------
-# Rate limiters (per tier)
-# ---------------------------------------------------------------------------
-class RateLimiter:
-    def __init__(self, rate: float, per: float):
-        self.rate = rate
-        self.per = per
-        self.tokens = float(rate)
-        self.last = time.time()
-        self.lock = threading.Lock()
+_load_state()
 
-    def acquire(self):
-        with self.lock:
-            now = time.time()
-            self.tokens = min(
-                self.rate,
-                self.tokens + (now - self.last) * (self.rate / self.per),
-            )
-            self.last = now
-            if self.tokens < 1:
-                wait = (1 - self.tokens) * (self.per / self.rate)
-                time.sleep(wait)
-                self.tokens = 0
-            else:
-                self.tokens -= 1
 
-RATE_LIMITERS = {
-    "anonymous": RateLimiter(rate=1, per=15.0),
-    "seed":      RateLimiter(rate=1, per=5.0),
-    "flower":    RateLimiter(rate=1, per=1.0),
-}
-
-def _rate_limit(tier: str):
-    limiter = RATE_LIMITERS.get(tier)
-    if limiter:
-        limiter.acquire()
-
-# ---------------------------------------------------------------------------
-# Upstream helpers
-# ---------------------------------------------------------------------------
-def _base_headers():
-    return {
+# ── helpers ──────────────────────────────────────────────────────────────────
+def _headers():
+    h = {
         "Content-Type": "application/json",
         "User-Agent": "curl/8.21.0",
         "Accept": "*/*",
     }
-
-def _headers_for_tier(tier: str):
-    h = _base_headers()
-    key = _key_for_tier(tier)
-    if key and key != "none":
-        h["Authorization"] = f"Bearer {key}"
+    if API_KEY and not SKIP_AUTH:
+        h["Authorization"] = f"Bearer {API_KEY}"
     return h
 
-def _fetch_upstream_models(tier: str):
-    """Fetch /models using the key for a given tier. Returns parsed JSON or None."""
-    key = API_KEYS.get(tier)
-    if not key:
-        return None
-    h = _base_headers()
-    if key and key != "none":
-        h["Authorization"] = f"Bearer {key}"
+
+def _ok(data):
+    return {"ok": True, "data": data}
+
+
+def _err(code, message):
+    return {"ok": False, "error": {"code": code, "message": str(message)}}
+
+
+def _model_id(m):
+    if isinstance(m, dict):
+        return m.get("id") or m.get("name") or ""
+    return str(m)
+
+
+def _fetch_models(force=False):
+    now = time.time()
+    with _state_lock:
+        if not force and _state["cache"] and (now - _state["cache_ts"]) < MODEL_CACHE_TTL:
+            return list(_state["cache"])
     try:
-        req = Request(UPSTREAM + "/models", headers=h)
+        req = Request(UPSTREAM + "/models", headers=_headers())
         with urlopen(req, timeout=15) as r:
             raw = r.read()
-        return json.loads(raw)
-    except HTTPError as e:
-        if VERBOSE:
-            sys.stderr.write(f"[pol-relay] models ({tier}) HTTP {e.code}\n")
-        return None
+            ctype = r.info().get_content_type()
+            if "event-stream" in ctype or raw.lstrip().startswith(b"data:"):
+                # Some Pollinations deployments stream SSE for /models.
+                pieces = []
+                for line in raw.split(b"\n"):
+                    line = line.strip()
+                    if line.startswith(b"data:"):
+                        payload = line[5:].strip()
+                        if payload and payload != b"[DONE]":
+                            pieces.append(payload)
+                raw = b"".join(pieces) or b"{}"
+            parsed = json.loads(raw)
+            models = parsed.get("data") if isinstance(parsed, dict) else parsed
+            if not isinstance(models, list):
+                models = []
     except Exception as e:
-        if VERBOSE:
-            sys.stderr.write(f"[pol-relay] models ({tier}) error: {e}\n")
-        return None
+        sys.stderr.write(f"[pol-relay] upstream /models failed: {e}\n")
+        with _state_lock:
+            return list(_state["cache"])
+    with _state_lock:
+        _state["cache"] = models
+        _state["cache_ts"] = now
+    return models
 
-def _aggregate_models():
-    """
-    Query /models with each tier's key and return a merged dict:
-        model_id -> {"tier": str, "source_tier": str, "raw": {...}}
-    """
-    merged = {}
-    for tier in ("anonymous", "seed", "flower"):
-        data = _fetch_upstream_models(tier)
-        if not data:
+
+def _annotate(models):
+    with _state_lock:
+        disabled = set(_state["disabled"])
+        tests = dict(_state["test_results"])
+    out = []
+    for m in models:
+        mid = _model_id(m)
+        if not mid:
             continue
-        items = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            mid = item.get("id")
-            if not mid:
-                continue
-            if mid in merged:
-                continue
-            merged[mid] = {
-                "tier": _model_tier(mid),
-                "source_tier": tier,
-                "raw": item,
-            }
-    # Ensure every known model appears even if upstream didn't list it.
-    for mid, tier in MODEL_TIER_MAP.items():
-        if mid not in merged:
-            merged[mid] = {
-                "tier": tier,
-                "source_tier": None,
-                "raw": {"id": mid, "object": "model", "owned_by": "pollinations"},
-            }
-    return merged
+        entry = dict(m) if isinstance(m, dict) else {"id": mid}
+        entry["enabled"] = mid not in disabled
+        entry["available"] = mid not in disabled
+        if mid in tests:
+            entry["last_test"] = tests[mid]
+        out.append(entry)
+    return out
 
-# ---------------------------------------------------------------------------
-# Health cache
-# ---------------------------------------------------------------------------
-_health_lock = threading.Lock()
-_health_cache = {"ts": 0.0, "data": {}}
-HEALTH_TTL = 30.0
 
-def _probe_health(force: bool = False):
-    now = time.time()
-    with _health_lock:
-        if not force and (now - _health_cache["ts"]) < HEALTH_TTL and _health_cache["data"]:
-            return _health_cache["data"]
+def _is_model_enabled(model_id):
+    with _state_lock:
+        return model_id not in _state["disabled"]
 
-    result = {}
-    for tier in ("anonymous", "seed", "flower"):
-        data = _fetch_upstream_models(tier)
-        if not data:
-            continue
-        items = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            mid = item.get("id")
-            if not mid:
-                continue
-            result[mid] = {
-                "healthy": True,
-                "tier": _model_tier(mid),
-                "source_tier": tier,
-                "checked_at": now,
-            }
 
-    for mid, tier in MODEL_TIER_MAP.items():
-        result.setdefault(
-            mid,
-            {"healthy": False, "tier": tier, "source_tier": None, "checked_at": now},
-        )
-
-    with _health_lock:
-        _health_cache["ts"] = now
-        _health_cache["data"] = result
+def _test_model(model_id, timeout=30):
+    body = json.dumps({
+        "model": model_id,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": False,
+    }).encode("utf-8")
+    req = Request(UPSTREAM + "/chat/completions", data=body,
+                  headers=_headers(), method="POST")
+    t0 = time.time()
+    try:
+        with urlopen(req, timeout=timeout) as r:
+            status = r.status
+            raw = r.read(4096)
+            ctype = r.info().get_content_type()
+            if "event-stream" in ctype or raw.lstrip().startswith(b"data:"):
+                ok = b"data:" in raw
+            else:
+                ok = 200 <= status < 300
+        result = {
+            "ok": ok,
+            "status": status,
+            "latency_ms": int((time.time() - t0) * 1000),
+            "ts": time.time(),
+        }
+    except HTTPError as e:
+        msg = ""
+        try:
+            msg = e.read().decode(errors="replace")[:200]
+        except Exception:
+            pass
+        result = {
+            "ok": False,
+            "status": e.code,
+            "latency_ms": int((time.time() - t0) * 1000),
+            "ts": time.time(),
+            "error": msg,
+        }
+    except Exception as e:
+        result = {
+            "ok": False,
+            "status": 0,
+            "latency_ms": int((time.time() - t0) * 1000),
+            "ts": time.time(),
+            "error": str(e)[:200],
+        }
+    with _state_lock:
+        _state["test_results"][model_id] = result
     return result
 
-# ---------------------------------------------------------------------------
-# HTTP handler
-# ---------------------------------------------------------------------------
+
+# ── handler ──────────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    server_version = "pol-relay/2.0"
 
-    # ---- logging ---------------------------------------------------------
     def log_message(self, fmt, *args):
         sys.stderr.write(f"[pol-relay] {fmt % args}\n")
 
-    # ---- response helpers ------------------------------------------------
-    def _send(self, code, body, ctype="application/json"):
-        if isinstance(body, (dict, list)):
-            body = json.dumps(body).encode("utf-8")
-        elif isinstance(body, str):
+    # ---- low level ----
+    def _send(self, code, body, ctype="application/json", extra_headers=None):
+        if isinstance(body, str):
             body = body.encode("utf-8")
-        elif body is None:
-            body = b""
         try:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Pol-Relay", "1")
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
             self.end_headers()
-            if body:
-                self.wfile.write(body)
+            self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _send_json(self, code, obj):
-        self._send(code, json.dumps(obj), "application/json")
+    def _send_json(self, code, payload):
+        self._send(code, json.dumps(payload).encode("utf-8"), "application/json")
 
-    def _stream_upstream(self, upstream, code=200):
-        """Relay an upstream streaming response using chunked transfer encoding."""
-        ctype = upstream.info().get_content_type() or "text/event-stream"
+    def _read_json(self):
         try:
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Transfer-Encoding", "chunked")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            while True:
-                chunk = upstream.read(1024)
-                if not chunk:
-                    break
-                self.wfile.write(b"%X\r\n" % len(chunk))
-                self.wfile.write(chunk)
-                self.wfile.write(b"\r\n")
-                self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            n = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            return None
+        if n <= 0:
+            return None
+        try:
+            return json.loads(self.rfile.read(n))
+        except Exception:
+            return None
 
-    # ---- CORS ------------------------------------------------------------
+    def _path(self):
+        p = urlparse(self.path)
+        return (p.path.rstrip("/") or "/"), parse_qs(p.query)
+
+    # ---- CORS ----
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Content-Length", "0")
+        self.send_header("Access-Control-Max-Age", "600")
         self.end_headers()
 
-    # ---- GET -------------------------------------------------------------
+    # ---- GET ----
     def do_GET(self):
-        path = self.path.split("?", 1)[0].rstrip("/")
-        if path in ("/v1/models", "/models"):
-            return self._handle_models()
-        if path in ("/v1/config", "/config"):
-            return self._handle_config()
-        if path in ("/v1/models/health", "/models/health"):
-            return self._handle_health()
-        if path in ("/healthz", "/v1/healthz"):
-            return self._send_json(200, {"ok": True, "upstream": UPSTREAM})
-        self._send_json(404, {"error": "not found"})
+        path, query = self._path()
 
-    # ---- POST ------------------------------------------------------------
-    def do_POST(self):
-        path = self.path.split("?", 1)[0].rstrip("/")
-
-        # Client-side auth check
-        client_auth = self.headers.get("Authorization")
-        if not SKIP_AUTH and not client_auth:
-            return self._send_json(
-                401, {"error": {"message": "Missing Authorization Header"}}
-            )
-
-        if path in ("/v1/models/toggle", "/models/toggle"):
-            return self._handle_toggle()
-        if path.endswith("/chat/completions"):
-            return self._handle_chat(client_auth)
-        self._send_json(404, {"error": "not found"})
-
-    # ---- /v1/models ------------------------------------------------------
-    def _handle_models(self):
-        try:
-            merged = _aggregate_models()
-        except Exception as e:
-            return self._send_json(502, {"error": str(e)})
-
-        data = []
-        for mid, meta in merged.items():
-            if _is_disabled(mid):
-                continue
-            item = dict(meta["raw"])
-            item["tier"] = meta["tier"]
-            data.append(item)
-
-        self._send_json(
-            200,
-            {
-                "object": "list",
-                "data": data,
-                "relay": {
-                    "upstream": UPSTREAM,
-                    "tiers_available": [
-                        t for t, k in API_KEYS.items() if k and k != "none"
-                    ],
-                },
-            },
-        )
-
-    # ---- /v1/config ------------------------------------------------------
-    def _handle_config(self):
-        try:
-            merged = _aggregate_models()
-            health = _probe_health()
-        except Exception as e:
-            return self._send_json(502, {"error": str(e)})
-
-        models = []
-        for mid, meta in merged.items():
-            h = health.get(mid, {})
-            models.append(
-                {
-                    "id": mid,
-                    "object": "model",
-                    "owned_by": meta["raw"].get("owned_by", "pollinations"),
-                    "tier": meta["tier"],
-                    "source_tier": meta["source_tier"],
-                    "enabled": not _is_disabled(mid),
-                    "healthy": bool(h.get("healthy", False)),
-                    "available": (
-                        meta["source_tier"] is not None
-                        and API_KEYS.get(meta["tier"], "none") != "none"
-                    ),
-                }
-            )
-
-        models.sort(key=lambda m: (m["tier"], m["id"]))
-
-        self._send_json(
-            200,
-            {
+        if path in ("/health", "/healthz"):
+            with _state_lock:
+                disabled_n = len(_state["disabled"])
+                cached_n = len(_state["cache"])
+            self._send_json(200, _ok({
+                "status": "ok",
+                "uptime_s": int(time.time() - _START_TS),
                 "upstream": UPSTREAM,
-                "skip_auth": SKIP_AUTH,
-                "tiers_available": [
-                    t for t, k in API_KEYS.items() if k and k != "none"
-                ],
-                "rate_limits": {
-                    "anonymous": "1/15s",
-                    "seed": "1/5s",
-                    "flower": "1/1s",
-                },
-                "total": len(models),
-                "enabled_count": sum(1 for m in models if m["enabled"]),
-                "models": models,
-            },
-        )
+                "disabled_models": disabled_n,
+                "cached_models": cached_n,
+            }))
+            return
 
-    # ---- /v1/models/health ----------------------------------------------
-    def _handle_health(self):
-        force = "refresh=1" in self.path or "force=1" in self.path
-        try:
-            health = _probe_health(force=force)
-        except Exception as e:
-            return self._send_json(502, {"error": str(e)})
-        self._send_json(
-            200,
-            {
-                "checked_at": health and next(iter(health.values()))["checked_at"],
-                "ttl": HEALTH_TTL,
-                "models": health,
-            },
-        )
+        if path in ("/v1/models", "/models"):
+            all_models = _fetch_models(force="refresh" in query)
+            annotated = _annotate(all_models)
+            include_disabled = query.get("all", ["false"])[0].lower() == "true"
+            if not include_disabled:
+                annotated = [m for m in annotated if m.get("enabled", True)]
+            self._send_json(200, {"object": "list", "data": annotated})
+            return
 
-    # ---- /v1/models/toggle ----------------------------------------------
-    def _handle_toggle(self):
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            length = 0
-        if length <= 0:
-            return self._send_json(400, {"error": "empty body"})
+        if path == "/admin/models":
+            all_models = _fetch_models(force="refresh" in query)
+            self._send_json(200, _ok(_annotate(all_models)))
+            return
 
-        try:
-            raw = self.rfile.read(length)
-            payload = json.loads(raw)
-        except Exception:
-            return self._send_json(400, {"error": "invalid json"})
+        if path == "/admin/models/disabled":
+            with _state_lock:
+                disabled = sorted(_state["disabled"])
+                tests = dict(_state["test_results"])
+            self._send_json(200, _ok({"disabled": disabled, "tests": tests}))
+            return
 
-        model_name = payload.get("model") or payload.get("id")
-        if not isinstance(model_name, str) or not model_name:
-            return self._send_json(400, {"error": "missing 'model'"})
+        self._send_json(404, _err("not_found", "not found"))
 
-        if "enabled" in payload:
-            enabled = bool(payload["enabled"])
-        elif "disabled" in payload:
-            enabled = not bool(payload["disabled"])
-        else:
-            # Toggle
-            enabled = _is_disabled(model_name)
+    # ---- POST ----
+    def do_POST(self):
+        path, _ = self._path()
 
-        _set_disabled(model_name, disabled=not enabled)
-        sys.stderr.write(
-            f"[pol-relay] model '{model_name}' {'enabled' if enabled else 'disabled'}\n"
-        )
-        self._send_json(
-            200,
-            {
-                "model": model_name,
-                "enabled": enabled,
-                "tier": _model_tier(model_name),
-            },
-        )
+        if path.startswith("/admin/"):
+            if not SKIP_AUTH and not self.headers.get("Authorization"):
+                self._send_json(401, _err("unauthorized", "Missing Authorization Header"))
+                return
+            self._handle_admin(path)
+            return
 
-    # ---- /v1/chat/completions -------------------------------------------
-    def _handle_chat(self, client_auth):
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            length = 0
-        if length <= 0:
-            return self._send_json(400, {"error": "empty body"})
+        if path.endswith("/v1/chat/completions") or path.endswith("/chat/completions"):
+            if not SKIP_AUTH and not self.headers.get("Authorization"):
+                self._send_json(401, _err("unauthorized", "Missing Authorization Header"))
+                return
+            self._handle_chat()
+            return
 
-        try:
-            raw = self.rfile.read(length)
-            params = json.loads(raw)
-        except Exception:
-            return self._send_json(400, {"error": "invalid json"})
+        self._send_json(404, _err("not_found", "not found"))
 
-        model_name = params.get("model") or "openai-fast"
-        if _is_disabled(model_name):
-            return self._send_json(
-                403,
-                {
-                    "error": {
-                        "message": f"Model '{model_name}' disabled by administrator",
-                        "type": "model_disabled",
-                        "code": "model_disabled",
-                    }
-                },
-            )
+    # ---- admin ----
+    def _handle_admin(self, path):
+        params = self._read_json() or {}
 
-        tier = _model_tier(model_name)
+        if path in ("/admin/models/enable", "/admin/models/disable", "/admin/models/toggle"):
+            mid = params.get("id")
+            if not mid:
+                self._send_json(400, _err("bad_request", "missing 'id'"))
+                return
+            with _state_lock:
+                if path.endswith("/enable"):
+                    _state["disabled"].discard(mid)
+                    enabled = True
+                elif path.endswith("/disable"):
+                    _state["disabled"].add(mid)
+                    enabled = False
+                else:  # toggle
+                    if mid in _state["disabled"]:
+                        _state["disabled"].discard(mid)
+                        enabled = True
+                    else:
+                        _state["disabled"].add(mid)
+                        enabled = False
+                _save_state()
+            self._send_json(200, _ok({"id": mid, "enabled": enabled}))
+            return
 
-        # Enforce rate limit for the tier we're about to use.
-        try:
-            _rate_limit(tier)
-        except Exception:
-            pass
+        if path == "/admin/models/test":
+            mid = params.get("id")
+            if not mid:
+                self._send_json(400, _err("bad_request", "missing 'id'"))
+                return
+            result = _test_model(mid)
+            self._send_json(200, _ok({"id": mid, **result}))
+            return
 
-        stream = bool(params.get("stream", False))
+        if path == "/admin/models/test-all":
+            all_models = _fetch_models()
+            ids = [m.get("id") for m in all_models
+                   if isinstance(m, dict) and m.get("id")]
+            results = {mid: _test_model(mid) for mid in ids}
+            self._send_json(200, _ok({"tested": len(ids), "results": results}))
+            return
 
-        # Build upstream headers.
-        headers = _base_headers()
+        if path == "/admin/models/reset":
+            with _state_lock:
+                _state["disabled"].clear()
+                _save_state()
+            self._send_json(200, _ok({"disabled": []}))
+            return
+
+        self._send_json(404, _err("not_found", "unknown admin endpoint"))
+
+    # ---- chat ----
+    def _handle_chat(self):
+        params = self._read_json()
+        if params is None:
+            self._send_json(400, _err("bad_request", "invalid or empty json"))
+            return
+
+        model_id = params.get("model")
+        if model_id and not _is_model_enabled(model_id):
+            self._send_json(403, _err("model_disabled",
+                                      f"model '{model_id}' is disabled"))
+            return
+
+        headers = _headers()
+        client_auth = self.headers.get("Authorization")
         if client_auth:
             headers["Authorization"] = client_auth
-        else:
-            key = _key_for_tier(tier)
-            if key and key != "none":
-                headers["Authorization"] = f"Bearer {key}"
 
+        stream = bool(params.get("stream", False))
         data = json.dumps(params).encode("utf-8")
-        req = Request(
-            UPSTREAM + "/chat/completions",
-            data=data,
-            headers=headers,
-            method="POST",
-        )
+        req = Request(UPSTREAM + "/chat/completions", data=data,
+                      headers=headers, method="POST")
 
         try:
-            upstream = urlopen(req, timeout=600)
+            upstream = urlopen(req, timeout=UPSTREAM_TIMEOUT)
+            ctype = upstream.info().get_content_type()
+
+            if stream:
+                self.send_response(200)
+                self.send_header("Content-Type", ctype or "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("X-Pol-Relay", "1")
+                self.end_headers()
+                try:
+                    while True:
+                        chunk = upstream.read(4096)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    self.wfile.write(b"\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                return
+
+            raw = upstream.read()
+            if "event-stream" in ctype or raw.lstrip().startswith(b"data:"):
+                raw = b"\n".join(
+                    line for line in raw.split(b"\n")
+                    if line.strip() != b"data: [DONE]"
+                )
+            self._send(200, raw, ctype or "application/json")
+
         except HTTPError as e:
-            err_body = e.read().decode(errors="replace")[:1000]
-            sys.stderr.write(
-                f"[pol-relay] upstream {e.code} for '{model_name}': {err_body[:200]}\n"
-            )
-            return self._send(
-                e.code,
-                json.dumps({"error": err_body}),
-                "application/json",
-            )
-        except URLError as e:
-            return self._send_json(
-                502, {"error": {"message": f"upstream unreachable: {e.reason}"}}
-            )
+            try:
+                body = e.read()[:500]
+            except Exception:
+                body = b""
+            try:
+                parsed = json.loads(body)
+                msg = (parsed.get("error") if isinstance(parsed, dict) else None) or body.decode(errors="replace")
+            except Exception:
+                msg = body.decode(errors="replace") or e.reason
+            sys.stderr.write(f"[pol-relay] upstream error {e.code}: {str(msg)[:200]}\n")
+            self._send_json(e.code, _err("upstream_error", msg))
+        except (URLError, TimeoutError) as e:
+            self._send_json(502, _err("upstream_unreachable", str(e)))
         except Exception as e:
-            return self._send_json(502, {"error": {"message": str(e)}})
+            self._send_json(500, _err("internal", str(e)))
 
-        ctype = upstream.info().get_content_type()
 
-        if stream:
-            return self._stream_upstream(upstream, 200)
-
-        # Non-streaming: read fully, strip SSE [DONE] if upstream misbehaves.
-        try:
-            body = upstream.read()
-        except Exception as e:
-            return self._send_json(502, {"error": {"message": str(e)}})
-
-        if "event-stream" in ctype or body.lstrip().startswith(b"data:"):
-            body = b"".join(
-                line
-                for line in body.split(b"\n")
-                if line.strip() != b"data: [DONE]"
-            )
-
-        self._send(200, body, ctype)
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-def main():
+if __name__ == "__main__":
     import socketserver
-
-    _load_state()
-
     socketserver.ThreadingTCPServer.request_queue_size = 128
     socketserver.ThreadingTCPServer.allow_reuse_address = True
-
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    tiers = [t for t, k in API_KEYS.items() if k and k != "none"]
-    sys.stderr.write(
-        f"[pol-relay] listening on 127.0.0.1:{PORT} -> {UPSTREAM}\n"
-        f"[pol-relay] tiers with keys: {tiers or ['(none)']}\n"
-        f"[pol-relay] SKIP_AUTH={SKIP_AUTH}  STATE_FILE={STATE_FILE}\n"
-    )
+    print(f"[pol-relay] listening on 127.0.0.1:{PORT} -> {UPSTREAM}", flush=True)
+    print(f"[pol-relay] data dir: {DATA_DIR}", flush=True)
+    print(f"[pol-relay] skip_auth: {SKIP_AUTH}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        sys.stderr.write("\n[pol-relay] shutting down\n")
-    finally:
-        server.server_close()
-
-if __name__ == "__main__":
-    main()
+        pass
