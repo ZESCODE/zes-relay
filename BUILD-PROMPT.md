@@ -1,5 +1,7 @@
 You are a senior TypeScript/React engineer. Build a production-quality Vite + React 18 + TypeScript control panel dashboard for pol_relay.py (the OpenAI-compatible Pollinations relay shown above, version 2.0). The dashboard's headline feature is per-model activation toggles plus a one-click "test all models" flow. Deliver complete, runnable code with no placeholders, no TODOs, and no "left as an exercise" comments.
 
+Design: frost design 
+https://github.com/ZESCODE/frost-cards
 ---
 
 1. Context you must respect
