@@ -1,0 +1,274 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ────────────────────────────────────────────────────────────────────────────
+   ZES Frost design tokens (adapted from ZESCODE/frost-cards).
+   Dark is the default; light mode keeps the same glass language.
+   ──────────────────────────────────────────────────────────────────────────── */
+:root {
+  --frost-bg: #f4f6fb;
+  --frost-bg-2: #e8ecf7;
+  --frost-text: #0b1020;
+  --frost-muted: #5b6478;
+  --frost-card: rgba(255, 255, 255, 0.5);
+  --frost-card-strong: rgba(255, 255, 255, 0.72);
+  --frost-border: rgba(15, 23, 42, 0.08);
+  --frost-border-strong: rgba(15, 23, 42, 0.14);
+  --frost-shadow: 0 4px 24px rgba(15, 23, 42, 0.08);
+  --frost-blur: 20px;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-top: env(safe-area-inset-top, 0px);
+}
+
+.dark {
+  --frost-bg: #04060c;
+  --frost-bg-2: #080d18;
+  --frost-text: #e6ebf5;
+  --frost-muted: #93a0b8;
+  --frost-card: rgba(255, 255, 255, 0.07);
+  --frost-card-strong: rgba(255, 255, 255, 0.12);
+  --frost-border: rgba(255, 255, 255, 0.09);
+  --frost-border-strong: rgba(255, 255, 255, 0.18);
+  --frost-shadow: 0 4px 24px rgba(0, 0, 0, 0.35);
+  --frost-blur: 20px;
+}
+
+@layer base {
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  html {
+    color-scheme: light;
+    text-size-adjust: 100%;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  html.dark {
+    color-scheme: dark;
+    background-color: #000;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    background-color: var(--frost-bg);
+    color: var(--frost-text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    /* Mobile: stop the whole page from rubber-banding behind fixed chrome. */
+    overscroll-behavior-y: none;
+    background-image:
+      radial-gradient(60rem 40rem at 110% -10%, rgba(99, 102, 241, 0.16), transparent 60%),
+      radial-gradient(45rem 35rem at -10% 110%, rgba(16, 185, 129, 0.12), transparent 60%);
+    background-attachment: fixed;
+  }
+
+  .dark body {
+    background-color: #000;
+    background-image:
+      radial-gradient(60rem 40rem at 110% -10%, rgba(99, 102, 241, 0.22), transparent 60%),
+      radial-gradient(45rem 35rem at -10% 110%, rgba(139, 92, 246, 0.14), transparent 60%);
+  }
+
+  button,
+  a,
+  input,
+  select,
+  textarea {
+    touch-action: manipulation;
+  }
+
+  /* iOS zooms into inputs under 16px — keep form controls at 16px on phones. */
+  @media (max-width: 640px) {
+    input,
+    select,
+    textarea {
+      font-size: 16px;
+    }
+  }
+
+  :focus-visible {
+    outline: 2px solid rgba(129, 140, 248, 0.9);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.35);
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  .glass {
+    background: var(--frost-card);
+    backdrop-filter: blur(var(--frost-blur));
+    -webkit-backdrop-filter: blur(var(--frost-blur));
+    border: 1px solid var(--frost-border);
+    box-shadow: var(--frost-shadow);
+  }
+
+  .glass-strong {
+    background: var(--frost-card-strong);
+    backdrop-filter: blur(calc(var(--frost-blur) + 6px));
+    -webkit-backdrop-filter: blur(calc(var(--frost-blur) + 6px));
+    border: 1px solid var(--frost-border-strong);
+    box-shadow: var(--frost-shadow);
+  }
+
+  .glass-card {
+    background: var(--frost-card);
+    backdrop-filter: blur(var(--frost-blur));
+    -webkit-backdrop-filter: blur(var(--frost-blur));
+    border: 1px solid var(--frost-border);
+    box-shadow: var(--frost-shadow), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    border-radius: 1.25rem;
+  }
+
+  .glass-input {
+    background: var(--frost-card);
+    border: 1px solid var(--frost-border-strong);
+    color: var(--frost-text);
+    border-radius: 0.75rem;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .glass-input::placeholder {
+    color: var(--frost-muted);
+  }
+  .glass-input:focus {
+    border-color: rgba(129, 140, 248, 0.7);
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18);
+    outline: none;
+  }
+
+  .glass-badge {
+    background: var(--frost-card);
+    border: 1px solid var(--frost-border-strong);
+    border-radius: 999px;
+    padding: 0.15rem 0.6rem;
+    font-size: 0.75rem;
+    line-height: 1.1rem;
+    white-space: nowrap;
+  }
+
+  .frost-green {
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.35), rgba(5, 150, 105, 0.18));
+    border: 1px solid rgba(16, 185, 129, 0.5);
+    box-shadow: 0 4px 20px rgba(16, 185, 129, 0.18), inset 0 1px 0 rgba(16, 185, 129, 0.22);
+  }
+  .frost-blue {
+    background: linear-gradient(135deg, rgba(59, 130, 246, 0.35), rgba(37, 99, 235, 0.18));
+    border: 1px solid rgba(59, 130, 246, 0.5);
+    box-shadow: 0 4px 20px rgba(59, 130, 246, 0.18), inset 0 1px 0 rgba(59, 130, 246, 0.22);
+  }
+  .frost-orange {
+    background: linear-gradient(135deg, rgba(245, 158, 11, 0.35), rgba(217, 119, 6, 0.18));
+    border: 1px solid rgba(245, 158, 11, 0.5);
+    box-shadow: 0 4px 20px rgba(245, 158, 11, 0.18), inset 0 1px 0 rgba(245, 158, 11, 0.22);
+  }
+  .frost-red {
+    background: linear-gradient(135deg, rgba(239, 68, 68, 0.35), rgba(220, 38, 38, 0.18));
+    border: 1px solid rgba(239, 68, 68, 0.5);
+    box-shadow: 0 4px 20px rgba(239, 68, 68, 0.18), inset 0 1px 0 rgba(239, 68, 68, 0.22);
+  }
+  .frost-violet {
+    background: linear-gradient(135deg, rgba(139, 92, 246, 0.35), rgba(109, 40, 217, 0.18));
+    border: 1px solid rgba(139, 92, 246, 0.5);
+    box-shadow: 0 4px 20px rgba(139, 92, 246, 0.18), inset 0 1px 0 rgba(139, 92, 246, 0.22);
+  }
+
+  .glass-btn-primary {
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.55), rgba(139, 92, 246, 0.55));
+    border: 1px solid rgba(129, 140, 248, 0.5);
+    box-shadow: 0 2px 14px rgba(99, 102, 241, 0.25);
+  }
+  .glass-btn-success {
+    background: linear-gradient(135deg, rgba(34, 197, 94, 0.45), rgba(16, 185, 129, 0.45));
+    border: 1px solid rgba(52, 211, 153, 0.45);
+    box-shadow: 0 2px 14px rgba(16, 185, 129, 0.2);
+  }
+  .glass-btn-danger {
+    background: linear-gradient(135deg, rgba(239, 68, 68, 0.45), rgba(220, 38, 38, 0.45));
+    border: 1px solid rgba(248, 113, 113, 0.45);
+    box-shadow: 0 2px 14px rgba(239, 68, 68, 0.2);
+  }
+
+  .hairline {
+    border-color: var(--frost-border);
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+
+  .pb-safe {
+    padding-bottom: calc(0.5rem + var(--safe-bottom));
+  }
+  .pt-safe {
+    padding-top: calc(0.5rem + var(--safe-top));
+  }
+  .mb-safe {
+    margin-bottom: calc(0.5rem + var(--safe-bottom));
+  }
+}
+
+@layer utilities {
+  .tap-scale:active {
+    transform: scale(0.97);
+  }
+  .text-muted {
+    color: var(--frost-muted);
+  }
+}
+
+/* ── Mobile performance ──────────────────────────────────────────────────────
+   backdrop-filter is the most expensive effect in this design. On phones we
+   halve the blur radius and drop hover transforms (which never fire anyway on
+   touch) so scrolling a 200-row model list stays smooth.
+   ──────────────────────────────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  :root,
+  .dark {
+    --frost-blur: 8px;
+  }
+  .glass-card,
+  .glass {
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.22);
+  }
+}
+
+@media (hover: none) {
+  .glass-card:hover,
+  .glass-btn:hover {
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* Long log lines: wrap instead of forcing horizontal scroll on a 360px screen. */
+.log-line {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
