@@ -13,7 +13,7 @@ pol_relay.py — Pollinations relay with:
 Environment variables:
   POL_RELAY_PORT    default 7179
   POL_UPSTREAM_BASE default https://gen.pollinations.ai/v1
-  POL_SKIP_AUTH     default false — if true, client Authorization header is not required
+  POL_SKIP_AUTH     default true — if true, client Authorization header is not required
   POL_API_KEY       legacy single key (used as 'anonymous' key if POL_API_KEYS unset)
   POL_API_KEYS      JSON map: {"anonymous":"none","seed":"sk_xxx","flower":"sk_yyy"}
   POL_STATE_FILE    path to persist disabled-model list (default ./pol_state.json)
