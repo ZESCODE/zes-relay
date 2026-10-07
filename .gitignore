@@ -1,0 +1,18 @@
+# Runtime state created by pol_relay.py and the panel sidecar
+data/
+FIRST-RUN.txt
+
+# Node / build artifacts
+node_modules/
+pol-panel/dist/
+pol-panel/node_modules/
+pol-panel/coverage/
+*.tsbuildinfo
+.vite/
+
+# Local env files
+.env
+.env.local
+*.log
+
+.DS_Store

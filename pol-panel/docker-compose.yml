@@ -1,0 +1,29 @@
+services:
+  pol-panel:
+    build:
+      context: ..
+      dockerfile: pol-panel/Dockerfile
+    image: zescode/pol-panel:latest
+    container_name: pol-panel
+    restart: unless-stopped
+    ports:
+      # Panel + API. The relay stays inside the container on 127.0.0.1:7179.
+      - "127.0.0.1:7178:7178"
+    environment:
+      PANEL_PORT: "7178"
+      PANEL_HOST: 0.0.0.0
+      PANEL_ALLOW_PUBLIC: "true"
+      # Create the admin on first boot, or leave unset to get a generated
+      # one-time password in `docker logs pol-panel`.
+      PANEL_ADMIN_USER: ${PANEL_ADMIN_USER:-admin}
+      PANEL_ADMIN_PASSWORD: ${PANEL_ADMIN_PASSWORD:-}
+      POL_RELAY_PORT: "7179"
+      POL_UPSTREAM_BASE: ${POL_UPSTREAM_BASE:-https://gen.pollinations.ai/v1}
+      POL_API_KEY: ${POL_API_KEY:-}
+      POL_SKIP_AUTH: ${POL_SKIP_AUTH:-true}
+      POL_DATA_DIR: /app/data
+    volumes:
+      - pol-panel-data:/app/data
+
+volumes:
+  pol-panel-data:
